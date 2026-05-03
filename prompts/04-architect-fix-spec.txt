@@ -1,0 +1,51 @@
+起 fix-batch-{N} SPEC,closes {phase}/track 撞的 finding:
+
+【背景】
+{Phase / sub-task} 跑完撞 {N} finding({M} blocker + {K} serious + ...):
+- {FINDING-1}({severity}, {layer}):{一句话症状}
+- {FINDING-2}({severity}, {layer}):{...}
+- ...
+
+【User 决策】(我推荐):
+- 修(severity ≥ minor 且实际影响后续):FINDING-1 / FINDING-2 / ...
+- 关闭 deferred(SPEC §X.Y 钦定 / 已 live 验证 / 不影响后续):FINDING-K / ...
+
+【请你(architect)做的】
+
+按 fix-batch SPEC 模式(参考前一波 fix-batch-{N-1} PR #{prev_pr},6 文件 +{XXXX} -{XX}):
+
+1. 写 {M} 个 fix SPEC,各 ~300 行,每个解 1 个 finding,1-2 层
+2. 写 1 个 PLAN(FIX_BATCH_{N}_*_PLAN.md)~150 行,统一规划:
+   - root cause 分类(类 A:audit ledger 缺写 / 类 B:facade auto-wire 不全 / ...)
+   - 依赖图(独立 vs serial)
+   - critical path 估算(并行 ~Xh,serial ~Yh)
+   - 收敛标准(M 个 fix PR 全 merge → phase 重跑 0 finding)
+   - **self-criticism §X**:本批 SPEC 起草时撞的什么自己跟自己打架,纠正措施(防重蹈)
+3. 更新 _board.md(+~15 行,加新 track 状态)
+4. push 到 architect/fix-finding-batch-{N}-{...} branch
+5. gh pr create --base main
+
+【约束】
+- ⛔ 不动 packages/X/src/(那是 dev 领地)
+- ⛔ 不动 .github/workflows/
+- ⛔ 不动 pyproject.toml 工具配置区
+- ✅ 只动 tasks/track-fix-{N}-*/SPEC.md + tasks/_board.md + docs/*PLAN*.md
+
+【方向选择】
+对每个真要修的 finding,给 user 列 2-3 个修法选项 + 推荐:
+- 选项 A:{方向 1}(优点 / 缺点 / 工时)
+- 选项 B:{方向 2}(优点 / 缺点 / 工时)
+- 推荐:{A or B},理由 {2-3 句}
+
+User 选完后写进 SPEC §5 步骤段。
+
+【收敛标准】
+本 fix-batch 完成 = M 个 fix PR 全 merge + phase-{N} 重跑 0 blocker + 0 serious(allow K6 deferred SPEC 钦定)。
+
+---
+
+# 怎么用
+
+User copy 上面 prompt,在 architect Claude Code session 输入(把 {N} {M} {K} {phase} {prev_pr} 等占位符换成实际值)。
+
+architect 写完 SPEC PR push → user 把 PR # 给我 → 我 sanity review → user 回 `ack` → 我代办 merge + spawn dev session。

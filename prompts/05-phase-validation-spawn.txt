@@ -1,0 +1,63 @@
+/{PROJECT}-dev develop track-arch-validation-{PHASE_NAME}
+
+你是 Track arch-validation-{PHASE_NAME} 的 Dev Agent. SPEC.md 已就位 @ commit {COMMIT}. SPEC_FROZEN.md 还没生成.
+
+【背景:fail-greedy 协议】
+本 sub-task 是**架构验证测试套**, 不写新业务代码, 只跑现有架构验证 N 维度(correctness / robustness / concurrency / adversarial / ...)。
+
+按 fail-greedy 协议(SKILL §4-V.3):
+- 撞 architecture bug 不停继续记 finding
+- 用 record_and_continue helper(详见 templates/findings-protocol.py)
+- pytest.xfail() 让 phase 继续往下跑
+- 跑完一波出 RESULTS.md 总账 → 给 architect batch review
+
+按 SKILL §1+§4 严格跑:
+
+1. /{PROJECT}-dev freeze track-arch-validation-{PHASE_NAME}
+2. step 1 onboarding (读 7 共享上下文 + SPEC_FROZEN + 上游 phase HANDOFF.md)
+3. step 2 PLAN (≥3 设计决策 + ≥2 推翻方案)
+4. step 3 implement (写 acceptance test + 复用或扩展 minimal_agent)
+5. step 4 self-test
+6. step 5 commit + push + gh pr create + RESULTS.md
+7. step 5.5 L4b headless claude --print
+
+8. fail-greedy 收尾:看 RESULTS.md finding 计数:
+   - 0 blocker + 0 serious → phase pass, alert_level: ok
+     → 走 §6.5 verify → §6.3 auto_merge → dispatcher 触发下一 phase
+   - ≥ 1 blocker / serious → alert_level: needs_human_batch_review
+     → 写 RESULTS.md 总账 + 写 PHASE-{N}-XXX.md 个体 finding 文件
+     → main session 监控会接到, ping user batch review
+
+9. SKILL §6.6 phase 收敛标准:0 blocker + 0 serious 才能 merge
+
+⛔ 禁止问 user 中间决策
+⛔ 禁止 End of Shift passive — step 5 push 后同 session 自跑闭环
+⛔ 撞 finding 不要 raw raise / pytest.fail() / assert ... — 用 record_and_continue → pytest.xfail()
+
+跑下去.
+
+---
+
+# 怎么 spawn
+
+```powershell
+$wt = "C:\Users\su200\Desktop\{PROJECT}-track-arch-validation-{PHASE_NAME}"
+$prompt = (Get-Content prompts/05-phase-validation-spawn.txt -Raw) `
+    -replace '{PHASE_NAME}', 'phase-1-bootstrap' `
+    -replace '{COMMIT}', 'b6c8d10' `
+    -replace '{PROJECT}', 'harness'
+
+$cmdLine = "claude --print --dangerously-skip-permissions `"$prompt`" > resume_log.txt 2>&1"
+Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdLine `
+    -WorkingDirectory $wt -WindowStyle Hidden -PassThru
+```
+
+# 5 个 phase 实战 spawn 顺序(harness 模式,你可以调整)
+
+phase-1-bootstrap → phase-2-correctness → phase-3-robustness → phase-4-concurrency → phase-5-adversarial
+
+按 SKILL §6.6 chain 设计:phase-N 等 phase-(N-1) done(0 finding 收敛)才 spawn。
+
+但实战可以**违反 serial 设计加速**:phase-3/4/5 跟 phase-2 一样独立 acceptance test,撞类似 finding 一次性给 architect batch review。
+- 优势:critical path ~3-5h(serial 估 ~12-20h)
+- 风险:多路同时撞 finding,user 一次决策大,但比 serial 等 4 轮快

@@ -1,0 +1,230 @@
+# Emergency Rescue Operations
+
+撞这些情况时,我代办的命令清单(从 harness 100h 实战抽出来,直接 copy 用)。
+
+---
+
+## 1. Dev session hang 在 commit + push(LLM compliance bug form (a))
+
+**症状**:dev session 写完 round N fix(SPEC.md / impl 改动),但 PROGRESS revision_round 不前进,git status 显示 M 但 0 unpushed commits。
+
+**诊断**:
+```bash
+cd ../{PROJECT}-track-{TRACK}
+git status --short
+git log @{u}..HEAD --oneline
+```
+
+如 git status 有 M + git log 0 commits → dev session 写完没 commit。
+
+**代办**:
+```bash
+cd ../{PROJECT}-track-{TRACK}
+git add {dev session 改的文件}
+git commit -m "$(cat <<'EOF'
+{round N} fix: {简短描述 verifier feedback 解了什么}
+
+{2-3 段:解了 verdict 的什么 BLOCK / SUGGEST,re-frozen with new sha256}
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+EOF
+)"
+git push --force-with-lease origin feat/track-{TRACK}
+```
+
+`--force-with-lease`(不是 `--force`)避免覆盖你不知道的 remote update。
+
+---
+
+## 2. Dev session passive 等 verify trigger(LLM compliance bug form (a))
+
+**症状**:dev session step 5 push 完 PR OPEN,L4b done 0 BLOCK,但 PROGRESS l4b: not_yet 没 update,session active 但什么都不做。
+
+**诊断**:
+```bash
+cat tasks/track-{TRACK}/PROGRESS.md | head -20
+ls -la tasks/track-{TRACK}/local_l4b_review*.md  # L4b review 文件存在?
+gh pr view {PR} --json comments --jq '.comments[] | select(.author.login == "{你 github 用户名}")'  # PR comment posted?
+```
+
+如 L4b review 已存在 + PR comment posted,但 PROGRESS 未 update → dev passive。
+
+**代办** `prompts/03-verify-session-spawn.txt` spawn verify session(直接接 §6.5 verify)。
+
+---
+
+## 3. Dev session 卡在 alert_level=needs_human_batch_review(SKILL §4.1 abort)
+
+**症状**:phase 重跑 spawn dev session,worktree 0 改动,resume_log 空,session 死。SKILL 看 PROGRESS alert_level=needs_human 直接 abort。
+
+**代办**(手动跑 rebase + pytest):
+```bash
+cd ../{PROJECT}-track-{TRACK}
+git fetch origin --quiet
+git rebase origin/main 2>&1 | tail -5
+
+# 跑 acceptance test
+cd packages/X
+python -m pytest ../../tests/arch-validation/{phase}/test_*.py -v --no-header 2>&1 | tail -25
+
+# 看结果决定 push:
+#   17 pass + K6 deferred xfail → 0 serious → commit + force push round N + 给 user 报告
+#   还有 finding → 给 user 报告 + 等下一波 fix-batch
+```
+
+---
+
+## 4. PR auto-merge 卡在 gh pr merge 步(LLM compliance bug)
+
+**症状**:PROGRESS status=auto_approving + alert_level=auto_approved + 7-gate 全过,但 PR 仍 OPEN(gh merge 没真跑或失败)。
+
+**代办**:
+```bash
+gh pr merge {PR} --repo {OWNER}/{REPO} --squash
+gh api -X DELETE "repos/{OWNER}/{REPO}/git/refs/heads/feat/track-{TRACK}"
+git checkout main && git pull origin main
+git log origin/main --oneline -3  # verify merged
+```
+
+---
+
+## 5. Architect SPEC PR 出来 → sanity review + brief
+
+**步骤**:
+```bash
+# 1. 找 PR
+gh pr list --repo {OWNER}/{REPO} --state open --json number,title,createdAt
+
+# 2. 看 PR 详情
+gh pr view {PR} --repo {OWNER}/{REPO} --json mergeable,statusCheckRollup,additions,deletions,changedFiles,files
+
+# 3. 看 PR body
+gh pr view {PR} --repo {OWNER}/{REPO} --json body --jq '.body'
+```
+
+Sanity review 检查项:
+- [ ] L1 CI / Contracts Import 全过
+- [ ] mergeable: MERGEABLE
+- [ ] 文件改动符合 fix-batch SPEC 模式(SPEC.md + PLAN.md + _board.md,不动 src/ / .github/)
+- [ ] 修的 finding 跟 user 之前 batch review 决策一致
+- [ ] critical path 估算合理
+- [ ] PLAN §X self-criticism 写了
+
+写 brief 给 user(等 1 字 ack):
+```markdown
+## PR #{N} sanity review 通过 ✅
+
+[PR #{N}](https://github.com/{OWNER}/{REPO}/pull/{N}):{title}
+
+| 项 | 内容 |
+|---|---|
+| 6 文件 / +{XXXX} -{XX} | ✓ |
+| L1 / Contracts | SUCCESS ✓ |
+| {解的 finding 列表} | ✓ |
+
+回 **`ack`** → 我代办 merge + spawn dev session,critical path ~{X}h。
+```
+
+---
+
+## 6. Kill zombie process(claude session 死了但进程没退)
+
+```powershell
+# 找 30+ min 没动的 claude 进程
+Get-Process | Where-Object { $_.ProcessName -eq 'claude' -and `
+    ((Get-Date) - $_.StartTime).TotalMinutes -gt 30 } | `
+    Select-Object Id, @{N='UpMin';E={[math]::Round(((Get-Date) - $_.StartTime).TotalMinutes, 1)}}
+
+# Kill 特定 PID
+Stop-Process -Id {PID} -Force
+
+# Bulk kill 所有 30+ min 没产出的(谨慎!)
+Get-Process | Where-Object { $_.ProcessName -eq 'claude' -and `
+    ((Get-Date) - $_.StartTime).TotalMinutes -gt 60 } | `
+    Stop-Process -Force
+```
+
+---
+
+## 7. API ping pong(撞 stream timeout 时判活)
+
+```bash
+# 测 Anthropic API alive
+claude --print "respond with one word: pong" 2>&1 | head -3
+# expected: "pong"
+
+# 测 codex CLI alive
+codex login status
+# expected: "Logged in as ..."
+```
+
+如 API 全崩 → 等 30-60 min 自然恢复(stream timeout 是 transient),然后 batch retry 死掉的 session。
+
+---
+
+## 8. Dispatcher daemon 重启
+
+```powershell
+# Kill 旧 daemon
+Get-Process powershell -ErrorAction SilentlyContinue | `
+    Where-Object { $_.MainWindowTitle -like "*dispatcher*" } | `
+    Stop-Process -Force
+
+# 启新 daemon hidden
+Start-Process powershell.exe `
+    -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", `
+                  "-File", "C:\path\to\tools\watcher\dispatcher.ps1" `
+    -WindowStyle Hidden `
+    -PassThru | Select-Object Id, ProcessName, StartTime
+```
+
+---
+
+## 9. Worktree 卡 file lock(常见 Windows 问题)
+
+```bash
+# 列所有 worktree
+git worktree list
+
+# 删卡的 worktree(强制)
+git worktree remove --force ../path/to/worktree
+
+# 如果 git 删不了,手动:
+rm -rf ../path/to/worktree
+git worktree prune
+```
+
+---
+
+## 10. Force push 安全清单
+
+⚠️ 永远用 `--force-with-lease` 而不是 `--force`:
+
+```bash
+# 安全:对方有 update 我不知道时会 reject
+git push --force-with-lease origin feat/track-{TRACK}
+
+# 危险:盲目覆盖
+git push --force origin feat/track-{TRACK}
+```
+
+`--force-with-lease` 检测 remote 是否被别人 update 过,有就拒绝(防双方覆盖)。
+
+⚠️ **永远不 force push 到 main / master**。如果 user 让你 force push 到 main,警告 user 风险。
+
+---
+
+# 兜底操作触发表
+
+| 症状 | 触发 |
+|---|---|
+| dev hang 在 commit | #1 |
+| dev passive 等 verify | #2 |
+| dev SKILL abort | #3 |
+| auto-merge 卡 | #4 |
+| architect PR 出来 | #5 |
+| 30+ min 僵尸进程 | #6 |
+| API stream timeout | #7 |
+| dispatcher crash | #8 |
+| worktree file lock | #9 |
+| 任何 force push | #10 |

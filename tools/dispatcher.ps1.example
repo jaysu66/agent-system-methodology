@@ -1,0 +1,344 @@
+<#
+Harness local dispatcher (watcher v5)
+======================================
+Replaces toast_watcher.ps1. Adds:
+  1. Toast notification on alert_level=needs_human/error/boundary_violation (v1 behavior)
+  2. STUCK DETECTION:
+       status=pr_submitted but no verifier worktree spawned >10 min after L4b done
+       → auto-spawn `claude --print "/harness-dev verify {track}"` headless
+       → fire toast "auto-spawned verify for {track}"
+  3. v4 (2026-04-30 Phase 1 retro): 兜底 dev agent 不跑 §6.3 archive
+       status=verify_done_round_N + alert_level=ok|awaiting_review >10 min
+       → auto-spawn `claude --print "/harness-dev review pr-{N} approve"`
+       → SKILL 自己判 auto_approve 7-gate,过则 §6.3 archive,不过则标 needs_human
+  4. v5 (2026-05-01 Phase 1.5 启动): Phase 1.5 auto-progression
+       某 sub-task 完成 (alert_level=auto_approved 或 main 含 squash commit) → 看 $PHASE15_DEPS
+       → 上游全 done 的下游自动 git worktree add + spawn `claude --print "/harness-dev freeze+develop"`
+       → user 0 介入 0 finding 的 phase 推进;只在 alert_level=needs_human_batch_review 才 mention user
+       → 实现 user 要的"问题不大就继续下一个 phase,一口气测完"
+  5. dispatcher_log.md persistent log
+
+Polls every 30s. State persisted in $env:TEMP\harness_dispatcher_state.txt.
+
+Run:
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File C:\Users\su200\Desktop\harness\tools\watcher\dispatcher.ps1" -WindowStyle Hidden
+#>
+
+$ErrorActionPreference = 'SilentlyContinue'
+$WORKTREES_PARENT = "C:\Users\su200\Desktop"
+$STATE_FILE       = "$env:TEMP\harness_dispatcher_state.txt"
+$LOG_FILE         = "C:\Users\su200\Desktop\harness\.agent-memory\dispatcher_log.md"
+$DASHBOARD_URL    = "http://localhost:8000"
+$STUCK_THRESHOLD_MIN = 10  # PR submitted >10 min without verifier worktree → stuck
+
+$TRACKS = @(
+    "time", "errors", "ledger", "activity", "adapters-openai",
+    "adapters-anthropic", "memory-event", "memory-fact",
+    "runtime-checkpoint", "runtime-loop", "action-tool", "action-skill",
+    "governance-permission", "governance-sandbox", "feedback-loop",
+    "feedback-verifier", "evolution"
+)
+
+# Load Windows Runtime toast types
+[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+
+function Escape-Xml {
+    param([string]$s)
+    if (-not $s) { return "" }
+    return $s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace "'", '&apos;' -replace '"', '&quot;'
+}
+
+function Show-Toast {
+    param([string]$Title, [string]$Body)
+    $tEsc = Escape-Xml $Title
+    $bEsc = Escape-Xml $Body
+    $xml = @"
+<toast activationType="protocol" launch="$DASHBOARD_URL">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>$tEsc</text>
+      <text>$bEsc</text>
+      <text>Click to open Harness dashboard</text>
+    </binding>
+  </visual>
+  <audio src="ms-winsoundevent:Notification.Looping.Alarm2"/>
+</toast>
+"@
+    try {
+        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $doc.LoadXml($xml)
+        $notif = [Windows.UI.Notifications.ToastNotification]::new($doc)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Harness Dispatcher").Show($notif)
+    } catch {
+        Write-Host "Toast emit failed: $($_.Exception.Message)"
+    }
+}
+
+function Write-DispatcherLog {
+    param([string]$Message)
+    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    "$ts $Message" | Add-Content -Path $LOG_FILE -Encoding utf8
+}
+
+function Spawn-Verify {
+    param([string]$Track)
+    $worktree = Join-Path $WORKTREES_PARENT "harness-track-$Track"
+    if (-not (Test-Path $worktree)) {
+        Write-DispatcherLog "spawn-verify FAIL: worktree not found $worktree"
+        return $false
+    }
+    # Detached background spawn via cmd.exe (claude is .cmd shim, not .exe)
+    $logfile = "$env:TEMP\harness_verify_$Track.log"
+    $cmd_line = "claude --print --dangerously-skip-permissions `"/harness-dev verify $Track`" > `"$logfile`" 2>&1"
+    try {
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmd_line -WorkingDirectory $worktree -WindowStyle Hidden -PassThru
+        Write-DispatcherLog "spawned verify ${Track}: PID=$($proc.Id) log=$logfile"
+        return $true
+    } catch {
+        Write-DispatcherLog "spawn-verify ERROR ${Track}: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Spawn-Approve {
+    param([string]$Track, [string]$PrNumber)
+    $worktree = Join-Path $WORKTREES_PARENT "harness-track-$Track"
+    if (-not (Test-Path $worktree)) {
+        Write-DispatcherLog "spawn-approve FAIL: worktree not found $worktree"
+        return $false
+    }
+    $logfile = "$env:TEMP\harness_approve_$Track.log"
+    $cmd_line = "claude --print --dangerously-skip-permissions `"/harness-dev review pr-$PrNumber approve`" > `"$logfile`" 2>&1"
+    try {
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmd_line -WorkingDirectory $worktree -WindowStyle Hidden -PassThru
+        Write-DispatcherLog "spawned approve ${Track} PR#${PrNumber}: PID=$($proc.Id) log=$logfile"
+        return $true
+    } catch {
+        Write-DispatcherLog "spawn-approve ERROR ${Track}: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# === v5 (2026-05-01): Phase 1.5 auto-progression ===
+# 监听 Phase 1.5 sub-task 完成,看依赖图自动 spawn 下一个 ready 的 sub-task
+# user 不需要介入 0 finding 的 phase 进展;只有 ≥1 blocker/serious finding 才 mention user
+
+$PHASE15_DEPS = @{
+    # 下游 track => 上游 tracks(全部 done 才 spawn 本 track)
+    "arch-validation-console-frontend" = @("arch-validation-console-backend")
+    "arch-validation-phase-1-bootstrap" = @(
+        "arch-validation-console-backend",
+        "arch-validation-console-frontend",
+        "arch-validation-findings-protocol"
+    )
+    "arch-validation-phase-2-correctness" = @("arch-validation-phase-1-bootstrap")
+    "arch-validation-phase-3-robustness" = @("arch-validation-phase-2-correctness")
+    "arch-validation-phase-4-concurrency" = @("arch-validation-phase-3-robustness")
+    "arch-validation-phase-5-adversarial" = @("arch-validation-phase-4-concurrency")
+
+    # === fix-batch-1 (2026-05-01,console-backend 撞 8 finding 的修复 SPEC PR #24)===
+    # console-backend done(merged 到 main)→ 自动 spawn fix-k1 / fix-ledger / fix-k2(3 路并行)
+    # fix-k2 done(SubscriptionHandle Protocol 落地)→ 自动 spawn fix-k3-k4 / fix-k5(2 路并行)
+    "fix-k1-facade-and-poll" = @("arch-validation-console-backend")
+    "fix-ledger-cursor" = @("arch-validation-console-backend")
+    "fix-k2-memory-observer" = @("arch-validation-console-backend")
+    "fix-k3-k4-observer" = @("fix-k2-memory-observer")
+    "fix-k5-observer" = @("fix-k2-memory-observer")
+}
+
+function Test-TrackDone {
+    param([string]$Track)
+    # 1. PROGRESS.md alert_level: auto_approved 表示 SKILL §6.3 archive 完成
+    $progress_path = Join-Path $WORKTREES_PARENT "harness-track-$Track\tasks\track-$Track\PROGRESS.md"
+    if (Test-Path $progress_path) {
+        $content = Get-Content $progress_path -Raw -ErrorAction SilentlyContinue
+        if ($content -match "(?m)^alert_level:\s*auto_approved") {
+            return $true
+        }
+    }
+    # 2. fallback: worktree 已 §6.3 cleanup,看 main 是否有 squash commit 含本 track 名
+    $log_check = & git -C "C:\Users\su200\Desktop\harness" log origin/main --oneline -50 2>$null
+    if ($log_check -match "track-$Track") {
+        return $true
+    }
+    return $false
+}
+
+function Test-AllUpstreamsDone {
+    param([string]$Track)
+    $upstreams = $PHASE15_DEPS[$Track]
+    if (-not $upstreams) { return $true }
+    foreach ($up in $upstreams) {
+        if (-not (Test-TrackDone $up)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Spawn-NextSubtask {
+    param([string]$Track)
+    $worktree = Join-Path $WORKTREES_PARENT "harness-track-$Track"
+    if (Test-Path $worktree) {
+        Write-DispatcherLog "spawn-next SKIP: worktree exists $worktree"
+        return $false
+    }
+    # git fetch + worktree add
+    & git -C "C:\Users\su200\Desktop\harness" fetch origin 2>&1 | Out-Null
+    $branch = "feat/track-$Track"
+    & git -C "C:\Users\su200\Desktop\harness" worktree add $worktree -b $branch origin/main 2>&1 | Out-Null
+    if (-not (Test-Path $worktree)) {
+        Write-DispatcherLog "spawn-next FAIL: worktree create failed for $Track"
+        return $false
+    }
+    # spawn dev session(同 Day 1 套路)
+    $logfile = "$env:TEMP\harness_dev_track-$Track.log"
+    $cmd_line = "claude --print --dangerously-skip-permissions `"/harness-dev freeze track-$Track`" > `"$logfile`" 2>&1 && claude --print --dangerously-skip-permissions `"/harness-dev develop track-$Track`" >> `"$logfile`" 2>&1"
+    try {
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmd_line -WorkingDirectory $worktree -WindowStyle Hidden -PassThru
+        Write-DispatcherLog "spawn-next SUCCESS: track-$Track PID=$($proc.Id) log=$logfile"
+        return $true
+    } catch {
+        Write-DispatcherLog "spawn-next ERROR ${Track}: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Self-test toast on startup
+Show-Toast -Title "Harness Dispatcher v5 started" -Body ("Polling " + $TRACKS.Count + " tracks every 30s. Auto-spawn verify/approve on stuck + Phase 1.5 auto-progression on phase done. Toast on alerts.")
+Write-DispatcherLog "dispatcher v5 startup, polling $($TRACKS.Count) tracks (v5 加 Phase 1.5 auto-progression: 上游全 done 自动 spawn 下游 dev session)"
+
+# Load previous state
+$lastState = @{}
+if (Test-Path $STATE_FILE) {
+    Get-Content $STATE_FILE -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_ -match "^([^=]+)=(.*)$") {
+            $lastState[$matches[1]] = $matches[2]
+        }
+    }
+}
+
+while ($true) {
+    $newState = @{}
+    foreach ($track in $TRACKS) {
+        $progress_path = Join-Path $WORKTREES_PARENT "harness-track-$track\tasks\track-$track\PROGRESS.md"
+        if (-not (Test-Path $progress_path)) { continue }
+
+        $content = Get-Content $progress_path -Raw -ErrorAction SilentlyContinue
+        if (-not $content) { continue }
+
+        $alert_level   = ""
+        $alert_message = ""
+        $status        = ""
+        $last_update   = ""
+        $pr_number     = ""
+        if ($content -match "(?m)^alert_level:\s*(.+)$")   { $alert_level   = $matches[1].Trim() }
+        if ($content -match "(?m)^alert_message:\s*(.+)$") { $alert_message = $matches[1].Trim() }
+        if ($content -match "(?m)^status:\s*(.+)$")       { $status        = $matches[1].Trim() }
+        if ($content -match "(?m)^last_update:\s*(.+)$")  { $last_update   = $matches[1].Trim() }
+        if ($content -match "(?m)^pr_number:\s*(\d+)")    { $pr_number     = $matches[1].Trim() }
+
+        # === Path 1: alert level escalation ===
+        if ($alert_level -in @("needs_human", "error", "boundary_violation")) {
+            $stateKey = "alert::${alert_level}::${alert_message}"
+            $newState[$track] = $stateKey
+            if (-not $lastState.ContainsKey($track) -or $lastState[$track] -ne $stateKey) {
+                $emoji = switch ($alert_level) {
+                    "boundary_violation" { "[BOUNDARY VIOLATION]" }
+                    "error"              { "[ERROR]" }
+                    "needs_human"        { "[NEEDS HUMAN]" }
+                    default              { "[ALERT]" }
+                }
+                Show-Toast -Title "$emoji track-$track" -Body $(if ($alert_message) { $alert_message } else { "Check dashboard" })
+                Write-DispatcherLog "ALERT $track [$alert_level]: $alert_message"
+            }
+            continue
+        }
+
+        # === Path 2: stuck detection — auto-spawn verify/approve when dev agent passive-waits ===
+        # Stuck patterns (2026-04-30 Phase 1 实测教训 + 2026-05-01 console-backend 教训):
+        #   - status=pr_submitted* (round 0 dev push 完没自调 verify;含 LLM 加后缀变体如 pr_submitted_l4b_done)
+        #   - status=step_5_done_round_N* (round N fix push 完没自调 verify)
+        #   - status=verify_done_round_N* + alert_level=ok|awaiting_review        → spawn approve (v4)
+        # 用 -match 前缀匹配兼容 dev agent 自加后缀(LLM compliance ≠ 100%)
+        $stuck_status_pattern = ($status -match "^pr_submitted") -or `
+                                ($status -match "^step_5_done") -or `
+                                ($status -match "^verify_done" -and $alert_level -in @("ok", "awaiting_review"))
+
+        if ($stuck_status_pattern) {
+            $verifier_worktree_a = Join-Path $WORKTREES_PARENT "workbench-verifier-$track"
+            $verifier_worktree_b = Join-Path $WORKTREES_PARENT "harness-verifier-$track"
+            $verifier_started = (Test-Path $verifier_worktree_a) -or (Test-Path $verifier_worktree_b)
+
+            # 决定 spawn 哪种:verify_done → approve;其他 → verify
+            # 用 -match 前缀匹配兼容 dev agent 自加后缀(2026-05-01 console-backend 教训)
+            $spawn_kind = ""
+            if ($status -match "^(pr_submitted|step_5_done)") {
+                if (-not $verifier_started) { $spawn_kind = "verify" }
+            } elseif ($status -match "^verify_done" -and $alert_level -in @("ok", "awaiting_review")) {
+                if ($pr_number) { $spawn_kind = "approve" }
+            }
+
+            if ($spawn_kind -and $last_update) {
+                $age_min = [int]((Get-Date).ToUniversalTime() - [DateTime]::Parse($last_update).ToUniversalTime()).TotalMinutes
+                if ($age_min -ge $STUCK_THRESHOLD_MIN) {
+                    $spawnKey = "stuck-spawned-${spawn_kind}::${track}::${status}"
+                    if (-not $lastState.ContainsKey($track) -or $lastState[$track] -ne $spawnKey) {
+                        $ok = $false
+                        if ($spawn_kind -eq "verify") {
+                            $ok = Spawn-Verify -Track $track
+                            if ($ok) {
+                                Show-Toast -Title "[AUTO-SPAWN] track-$track verify" -Body "SKILL §6.5 stuck (status=$status) $age_min min — dispatcher spawned headless verify. No action needed."
+                            }
+                        } elseif ($spawn_kind -eq "approve") {
+                            $ok = Spawn-Approve -Track $track -PrNumber $pr_number
+                            if ($ok) {
+                                Show-Toast -Title "[AUTO-SPAWN] track-$track approve PR#$pr_number" -Body "SKILL §6.3 stuck (verify_done $age_min min) — dispatcher spawned headless approve. SKILL auto_approve gate 自检."
+                            }
+                        }
+                        if (-not $ok) {
+                            Show-Toast -Title "[SPAWN FAIL] track-$track" -Body "Tried claude --print $spawn_kind but failed. Check dispatcher_log.md."
+                        }
+                        $newState[$track] = $spawnKey
+                        continue
+                    }
+                }
+            }
+        }
+
+        # Track is fine — keep state but don't toast
+    }
+
+    # === Path 3: Phase 1.5 auto-progression(v5)===
+    # 看依赖图,每个 candidate 下游 track:上游全 done 且自己没 spawn → spawn
+    foreach ($next_track in $PHASE15_DEPS.Keys) {
+        $worktree_check = Join-Path $WORKTREES_PARENT "harness-track-$next_track"
+        if (Test-Path $worktree_check) { continue }  # 已 spawn 过(worktree 存在或 §6.3 cleanup 后 main 含 commit)
+
+        if (-not (Test-AllUpstreamsDone $next_track)) { continue }
+
+        $spawnKey = "auto-spawned-next::${next_track}"
+        if ($lastState.ContainsKey($next_track) -and $lastState[$next_track] -eq $spawnKey) { continue }
+
+        Write-DispatcherLog "auto-progression: all upstreams done for $next_track, attempting spawn"
+        $ok = Spawn-NextSubtask -Track $next_track
+        if ($ok) {
+            Show-Toast -Title "[AUTO-SPAWN] track-$next_track" -Body "上游全 done,dispatcher v5 自动启动 (Phase 1.5 推进). user-on-the-loop 不需要操作."
+            $newState[$next_track] = $spawnKey
+        } else {
+            Show-Toast -Title "[AUTO-SPAWN FAIL] track-$next_track" -Body "Spawn 失败,看 dispatcher_log.md"
+            $newState[$next_track] = "auto-spawn-failed::${next_track}"
+        }
+    }
+
+    # Persist new state
+    $lines = @()
+    foreach ($k in $newState.Keys) {
+        $lines += "$k=$($newState[$k])"
+    }
+    $lines | Set-Content $STATE_FILE -Encoding utf8
+    $lastState = $newState
+
+    Start-Sleep -Seconds 30
+}

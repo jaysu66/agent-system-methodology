@@ -1,0 +1,73 @@
+/{PROJECT}-dev develop track-{TRACK}
+
+你是 Track {TRACK} 的 Dev Agent。SPEC.md 已就位 @ commit {COMMIT}。SPEC_FROZEN.md 还没生成。
+
+【背景】
+{2-3 句:你解的什么 finding / 你做的 sub-task 上下文 / 跟前一波 fix-batch 的关系}
+
+【你要做的】按 SKILL §1+§4 严格跑:
+
+1. /{PROJECT}-dev freeze track-{TRACK} (校验 12 段 + 算 sha256 → 生成 SPEC_FROZEN.md)
+2. step 1 onboarding (读 7 共享上下文 + SPEC_FROZEN + 上游 HANDOFF.md)
+3. step 2 PLAN (≥3 设计决策 + ≥2 推翻方案)
+4. step 3 implement (只动 SPEC §8 钦定文件,禁动 .github / contracts / pyproject.toml ruff/mypy 段)
+5. step 4 self-test (13 工具全过 + 33 grep 反清单 0-hit)
+6. step 5 commit + push + gh pr create
+7. step 5.5 L4b headless claude --print (boundary check + 4 维度审, post PR comment)
+8. §6.5 verify (codex CLI 优先, fallback claude --print --model opus, 写 verifier_report.md)
+9. §6.4 / §6.5 自动 revision 闭环 (max 3 轮 each)
+10. §10 auto_approve 7-gate (L1 ✓ + L4b 0 BLOCK + L2 verdict=pass + L2 0 blocks + boundary clean + revision_round ≤ max + l2_revision_round ≤ max) → gh pr merge --squash
+11. §6.3 archive (写 HANDOFF + .agent-memory/SESSIONS/{date}-track-{TRACK}.md + INDEX/CONTEXT/board 更新 + commit + push)
+
+⛔ 禁止问 user 中间决策 (SKILL §4.2 自动闭环铁律)
+⛔ 禁止 "End of Shift passive" — step 5 push 后同 session 自跑 step 5.5 + §6.5 verify 闭环到 auto_merge
+⛔ 仅 4 种情况可 mention user:
+   1. G1 boundary check 越权
+   2. max_rounds (3) 用尽
+   3. max_l2_rounds (3) 用尽
+   4. system error (API 502 retry exhausted / 上游 contracts bug 阻塞 step 4 等)
+
+跑下去。
+
+---
+
+# 怎么 spawn 这个 prompt
+
+PowerShell hidden mode(走 user Max 订阅 0 额外费):
+
+```powershell
+$wt = "C:\Users\su200\Desktop\{PROJECT}-track-{TRACK}"
+$prompt = (Get-Content prompts/02-dev-session-spawn.txt -Raw) `
+    -replace '{TRACK}', 'fix-phase1-001-adapter-ledger' `
+    -replace '{COMMIT}', '380acd8' `
+    -replace '{PROJECT}', 'harness'
+
+$cmdLine = "claude --print --dangerously-skip-permissions `"$prompt`" > resume_log.txt 2>&1"
+$proc = Start-Process -FilePath "cmd.exe" `
+    -ArgumentList "/c", $cmdLine `
+    -WorkingDirectory $wt `
+    -WindowStyle Hidden -PassThru
+"spawned : PID $($proc.Id)"
+```
+
+Bash equivalent(WSL / macOS / Linux):
+
+```bash
+WT="$HOME/work/{PROJECT}-track-{TRACK}"
+PROMPT=$(sed -e 's/{TRACK}/fix-phase1-001/g' \
+             -e 's/{COMMIT}/380acd8/g' \
+             -e 's/{PROJECT}/harness/g' prompts/02-dev-session-spawn.txt)
+
+cd "$WT" && nohup claude --print --dangerously-skip-permissions "$PROMPT" > resume_log.txt 2>&1 &
+echo "spawned : PID $!"
+```
+
+# 监控
+
+Spawn 完后 `claude --print` 会跑 30-60 min(取决于 SPEC 复杂度)。期间:
+
+- `tail -f resume_log.txt`(看 dev session 实时输出)
+- `cat tasks/track-{TRACK}/PROGRESS.md`(看 status 字段流转)
+- `gh pr list`(等 PR 出来)
+
+撞 hang(progress 30+ min 没变):dispatcher daemon 30s polling 自动兜底 spawn verify。

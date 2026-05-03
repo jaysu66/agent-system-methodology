@@ -1,0 +1,76 @@
+/{PROJECT}-dev verify track-{TRACK}
+
+你是 Independent Verifier Agent for Track {TRACK} (PR #{PR} @ commit {COMMIT}).
+
+【背景】
+Dev session 已跑完 step 1-5 + step 5.5 L4b auto-review.
+- L1 CI: 已全过 (Static Quality + Contracts Import)
+- L4b tally: {从 PROGRESS.md l4b_tally 读, 0 BLOCK / N SUGGEST / N NIT, approve=true}
+- Boundary check: 已 ACK (如有 SPEC §8 钦定例外)
+
+【你要做的】按 SKILL §5 协议跑 4 step:
+
+1. Read-only Onboard
+   - 读 SPEC_FROZEN.md / contracts/*.py / DEV_SPEC.md / CRITIQUE_HISTORY §9
+   - 写 verifier_understanding.md (≥ 100 字)
+   - 不读 dev impl / UNDERSTANDING / PLAN / dev unit tests / dev L4b review
+
+2. Independent Test
+   - 写 verifier_test.py (≥ 5 positive case + ≥ 5 negative @pytest.mark.xfail)
+   - 自跑通过 (positive 全过 + negative 全 xfail)
+
+3. Run on Dev Impl
+   - git checkout dev impl: `git checkout origin/feat/track-{TRACK} -- packages/X/src/X/{LAYER}/`
+   - 跑 verifier_test.py + conformance + dev unit tests
+   - 收集 results
+
+4. Report
+   - 写 verifier_report.md (7 段, 5+ 可疑点, 总评 pass/needs_revision/reject)
+   - 最后一行机器可读 tally:
+     `<!-- l2-tally: {"verdict": "pass|needs_revision|reject", "blocks": N, "suggestions": N, "model": "..."} -->`
+
+模型级联 (优先 OpenAI 跨模型族, Opus 兜底):
+   ┌─ try 1: codex CLI (gpt-5.5, 跨模型族, 理想态)
+   │   command -v codex && codex login status | grep "Logged in"
+   │   → spawn:  codex exec "<verifier prompt>"
+   │   → 用这条:verifier_model = codex/gpt-5.5
+   │
+   ├─ fallback: claude --print --model opus (Anthropic 同族不同模型)
+   │   command -v claude
+   │   → spawn:  claude --print --model opus "<verifier prompt>"
+   │   → 用这条:verifier_model = claude/opus-4.7
+   │
+   └─ both fail: abort + 提示 install codex 或 claude CLI
+
+把实际用的模型写进 verifier_report.md 头部 (字段:`verifier_model_used`).
+
+跑完写 verifier_report.md, 然后按 SKILL §6.3 §10 auto_approve 7-gate 自动判:
+- 全 7 条过 (L1 ✓ + L4a optional + L4b 0 BLOCK ✓ + L2 verdict=pass + L2 0 blocks + boundary clean + revision_round ≤ max + l2_revision_round ≤ max)
+  → gh pr merge --squash + delete branch + 写 HANDOFF.md + archive memory + push archive commit
+- L2 needs_revision → §6.5 spawn dev resume revision (max 3 rounds)
+- L2 reject → §6.5 spawn revision (max 3 rounds), 用尽 → mention user
+
+⛔ 禁止问 user 中间决策. 严按 SKILL §4.2 自动闭环铁律. 全自动跑.
+
+跑下去.
+
+---
+
+# 谁 spawn 这个
+
+正常情况 dev session step 5.5 L4b 完成后 0 BLOCK → dev session 自调本 verify (SKILL §4.2 自动闭环).
+
+兜底情况 main session 代办 spawn (dispatcher 检测到 dev session passive 等 trigger > 30 min):
+
+```powershell
+$wt = "C:\Users\su200\Desktop\{PROJECT}"  # main worktree (SKILL §5 独立 setup workbench-verifier-{X})
+$prompt = (Get-Content prompts/03-verify-session-spawn.txt -Raw) `
+    -replace '{TRACK}', 'fix-phase1-001-adapter-ledger' `
+    -replace '{PR}', '34' `
+    -replace '{COMMIT}', '8ee3587' `
+    -replace '{PROJECT}', 'harness'
+
+$cmdLine = "claude --print --dangerously-skip-permissions `"$prompt`" > verify_log.txt 2>&1"
+Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdLine `
+    -WorkingDirectory $wt -WindowStyle Hidden -PassThru
+```

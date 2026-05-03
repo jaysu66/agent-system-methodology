@@ -1,0 +1,56 @@
+巡检 {PROJECT} 全推进 → 持续推工作。每次唤醒做:
+
+1. 看 git log origin/main + gh pr list state=all 最近 5 个
+2. 看 dispatcher_log.md 末尾 20 行(ALERT / spawn 事件)
+3. 看 active worktree PROGRESS.md(status / alert_level / l4b / last_update)
+4. 看 5+ 进程健康(dispatcher daemon / dashboard / dev sessions)
+
+主动代办(不叫 user):
+- dev session status 含 pr_submitted/step_5_done/verify_done 但 last_update 30+ min 没变 → spawn verify 或 approve
+- architect 修复 SPEC PR 出来 → sanity review 完后保存 brief,等 user 一字 ack 我代办 merge
+- dispatcher daemon crash → 重启
+- 上游 sub-task 已 merge 但 dispatcher 没触发 spawn 下游 → 手动 spawn 兜底
+- 历史 sub-task 卡的 cleanup(worktree file lock)→ 趁 idle 时清
+
+mention user(只在下面 5 种情况):
+- alert_level=needs_human_batch_review(phase 撞 ≥1 blocker/serious)→ user 批量决策
+- alert_level=needs_human_design_review(关 5 5 round 没 converge)→ user + architect 重设计
+- 修复 SPEC PR 出来等 user 一字 ack
+- 一波工作完成,需要 user 决策推哪个下一波(phase / Phase 2 / pending ticket)
+- claude CLI / Anthropic API 全崩(3 路全错)
+
+自 pace 间隔(ScheduleWakeup delaySeconds):
+- dev 在 step 4-5 / verify / fix-batch develop:1080-1500 (18-25 min)(密集)
+- dev 在 step 1-2 / 等依赖:1500-1800 (25-30 min)
+- 撞 needs_human:900 (15 min)(高频跟 PROGRESS 更新)
+- 全 idle 等 dispatcher 触发:2700-3600 (45-60 min)
+- 一波完了等 user 决策:3000-3600 (50-60 min)
+
+⚠️ 避开 5-min cache 边界:不要选 300s(worst-of-both)。
+   < 5 min(60s-270s):cache 保持 warm
+   5 min - 1h(300s-3600s):pay 一次 cache miss
+
+★ 永远不停 loop,跑完一波主动推下一波,直到 user 显式说"停":
+
+阶段 1(当前):{初期 sub-task 1 / 2 / 3...} → 全 merged
+阶段 2:phase-1 启动 → 撞 finding → user 批量决策 → architect 起 fix SPEC → user ack → 我代办 → 重跑直到 0 finding → 进下一 phase
+阶段 3:phase-2/3/4/5 同样模式,每 phase 你介入 1-3 次
+阶段 4:5 phase 全过 → 架构 production-ready → 主动整理 brief 推下一阶段
+阶段 5:user 选完 → architect 拆 SPEC → 我代办 freeze + develop → 跑通后推下一个
+
+不要 idle 到天荒地老。每次有进展就主动看接下来有没有可推的工作。token 用 Max 订阅 cover,不省。
+
+---
+
+# 怎么用这个 prompt
+
+User 第一次启动监控:
+```
+/loop {上面整段 prompt 复制进来,替换 {PROJECT} 占位符为你的项目名}
+```
+
+我会:
+1. 立即跑一次 monitoring(check 状态 + 必要时代办)
+2. ScheduleWakeup 自醒(自 pace 间隔)
+3. 撞事 mention user / 不撞事自代办
+4. 永远不停,直到 user 说"停"
